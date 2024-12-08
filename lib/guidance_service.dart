@@ -23,20 +23,19 @@ class GuidanceService {
     if (!_isReady) return;
 
     String message;
-    if (deviation.abs() < 0.1) {
-      message = "Good, stay centered";
-    } else if (deviation.abs() < 0.3) {
-      message = deviation > 0 ? "Gently move left" : "Gently move right";
-    } else if (deviation.abs() < 0.6) {
-      message = deviation > 0 ? "Move more to the left" : "Move more to the right";
+    if (deviation.abs() < 0.05) {
+      message = "Centered";
+    } else if (deviation.abs() < 0.2) {
+      message = deviation > 0 ? "Slight left" : "Slight right";
+    } else if (deviation.abs() < 0.4) {
+      message = deviation > 0 ? "Move left" : "Move right";
     } else {
-      message = deviation > 0 ? "Warning, far left" : "Warning, far right";
+      message = deviation > 0 ? "Far left" : "Far right";
     }
 
-    // Only speak if message changed or enough time has passed
     if (message != lastMessage || 
         (lastGuidance != null && 
-         DateTime.now().difference(lastGuidance!) > const Duration(seconds: 3))) {  // Increased delay
+         DateTime.now().difference(lastGuidance!) > const Duration(seconds: 2))) {
       
       _isReady = false;
       lastMessage = message;
@@ -44,12 +43,19 @@ class GuidanceService {
       
       await tts.speak(message);
       
-      // Increased cooldown for better spacing between messages
       _cooldownTimer?.cancel();
-      _cooldownTimer = Timer(const Duration(milliseconds: 800), () {
+      _cooldownTimer = Timer(const Duration(milliseconds: 500), () {
         _isReady = true;
       });
     }
+  }
+
+  Future<void> stop() async {
+    _cooldownTimer?.cancel();
+    _isReady = true;
+    lastMessage = null;
+    lastGuidance = null;
+    await tts.stop();
   }
 
   void dispose() {

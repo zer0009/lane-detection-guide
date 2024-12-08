@@ -1,6 +1,6 @@
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'dart:typed_data';
-import 'dart:math' show pi, min, max;
+import 'dart:math' show pi, min, max, sqrt;
 import 'package:flutter/foundation.dart' show debugPrint;
 
 class LaneDetectionResult {
@@ -35,8 +35,8 @@ class LaneDetector {
     final roiPoints = [
       cv.Point(0, height),                           
       cv.Point(width, height),                       
-      cv.Point((width * 0.65).toInt(), (height * 0.6).toInt()),  
-      cv.Point((width * 0.35).toInt(), (height * 0.6).toInt()),  
+      cv.Point((width * 0.85).toInt(), (height * 0.5).toInt()),  // Adjusted ROI
+      cv.Point((width * 0.15).toInt(), (height * 0.5).toInt()),  // Adjusted ROI
     ];
     
     final roiContours = cv.VecVecPoint.fromList([roiPoints]);
@@ -70,6 +70,9 @@ class LaneDetector {
       
       final height = img.rows;
       final width = img.cols;
+      
+      // Define center X coordinate
+      final centerX = width / 2;
 
       // Resize image for faster processing
       final processWidth = (width * PROCESSING_SCALE).toInt();
@@ -86,11 +89,11 @@ class LaneDetector {
       resources.add(gray);
       
       // Apply blur and threshold in one step for better performance
-      final blurred = cv.gaussianBlur(gray, (3, 3), 0);  // Smaller kernel
+      final blurred = cv.gaussianBlur(gray, (5, 5), 1.5);  // Increased blur
       resources.add(blurred);
 
       // Simplified edge detection with fixed thresholds for speed
-      final edges = cv.canny(blurred, 50, 150);
+      final edges = cv.canny(blurred, 30, 90);  // Adjusted thresholds
       resources.add(edges);
 
       // Apply ROI mask
@@ -102,11 +105,11 @@ class LaneDetector {
       // Optimize Hough transform parameters
       final lines = cv.HoughLinesP(
         maskedEdges,
-        2.0,  // Increase step size
+        1.0,  // Reduced step size for better accuracy
         pi / 180.0,
-        15,   // Lower threshold
-        minLineLength: 15.0,  // Shorter lines
-        maxLineGap: 100.0     // Larger gaps allowed
+        20,   // Increased threshold
+        minLineLength: 30.0,  // Longer minimum line length
+        maxLineGap: 50.0      // Reduced max gap
       );
       resources.add(lines);
 
@@ -115,11 +118,11 @@ class LaneDetector {
         return _lastResult!;
       }
 
-      // Efficient line filtering
-      final centerX = width / 2;
-      List<double> leftLines = [];
-      List<double> rightLines = [];
-
+      // Enhanced line filtering and clustering
+      final List<List<double>> leftClusters = [];
+      final List<List<double>> rightClusters = [];
+      const double CLUSTER_THRESHOLD = 50.0; // pixels
+      
       for (int i = 0; i < lines.rows; i++) {
         final line = lines.row(i);
         final x1 = line.at<int>(0, 0).toDouble() / PROCESSING_SCALE;
@@ -127,45 +130,91 @@ class LaneDetector {
         final x2 = line.at<int>(0, 2).toDouble() / PROCESSING_SCALE;
         final y2 = line.at<int>(0, 3).toDouble() / PROCESSING_SCALE;
         
-        final angle = (y2 - y1) != 0 ? ((x2 - x1) / (y2 - y1)).abs() : double.infinity;
-        if (angle > 0.2 && angle < 2.0) {
+        final dy = (y2 - y1);
+        final dx = (x2 - x1);
+        final angle = dy != 0 ? (dx / dy).abs() : double.infinity;
+        
+        // Stricter angle filtering
+        if (angle > 0.3 && angle < 1.2) {  // Even narrower angle range
           final avgX = (x1 + x2) / 2;
+          final avgY = (y1 + y2) / 2;
+          final lineLength = sqrt(dx * dx + dy * dy);
           
-          // Draw lines only if they're significantly different from previous frame
-          cv.line(
-            visualOutput,
-            cv.Point(x1.toInt(), y1.toInt()),
-            cv.Point(x2.toInt(), y2.toInt()),
-            avgX < centerX ? cv.Scalar(255, 0, 0) : cv.Scalar(0, 0, 255),
-            thickness: 2
-          );
+          // Only consider longer lines in the lower portion
+          if (avgY > height * 0.6 && lineLength > 30) {
+            bool addedToCluster = false;
+            
+            if (avgX < centerX) {
+              // Try to add to existing left clusters
+              for (var cluster in leftClusters) {
+                if ((cluster.reduce((a, b) => a + b) / cluster.length - avgX).abs() < CLUSTER_THRESHOLD) {
+                  cluster.add(avgX);
+                  addedToCluster = true;
+                  break;
+                }
+              }
+              if (!addedToCluster) {
+                leftClusters.add([avgX]);
+              }
+            } else {
+              // Try to add to existing right clusters
+              for (var cluster in rightClusters) {
+                if ((cluster.reduce((a, b) => a + b) / cluster.length - avgX).abs() < CLUSTER_THRESHOLD) {
+                  cluster.add(avgX);
+                  addedToCluster = true;
+                  break;
+                }
+              }
+              if (!addedToCluster) {
+                rightClusters.add([avgX]);
+              }
+            }
 
-          if (avgX < centerX) {
-            leftLines.add(avgX);
-          } else {
-            rightLines.add(avgX);
+            cv.line(
+              visualOutput,
+              cv.Point(x1.toInt(), y1.toInt()),
+              cv.Point(x2.toInt(), y2.toInt()),
+              avgX < centerX ? cv.Scalar(255, 0, 0) : cv.Scalar(0, 0, 255),
+              thickness: 2
+            );
           }
         }
       }
 
-      // Quick early return if no valid lines
-      if (leftLines.isEmpty && rightLines.isEmpty) {
-        _lastResult = LaneDetectionResult(0.0, cv.imencode('.jpg', visualOutput).$2, false);
-        return _lastResult!;
-      }
+      // Filter out small clusters and calculate lane center
+      leftClusters.removeWhere((cluster) => cluster.length < 2);
+      rightClusters.removeWhere((cluster) => cluster.length < 2);
 
-      // Efficient lane center calculation
       double laneCenter;
-      if (leftLines.isNotEmpty && rightLines.isNotEmpty) {
-        leftLines.sort();
-        rightLines.sort();
-        final leftMedian = leftLines[leftLines.length ~/ 2];
-        final rightMedian = rightLines[rightLines.length ~/ 2];
-        laneCenter = (leftMedian + rightMedian) / 2;
-      } else if (leftLines.isNotEmpty) {
-        laneCenter = leftLines[leftLines.length ~/ 2] + width * 0.25;
+      bool isValidLane = false;
+
+      if (leftClusters.isNotEmpty && rightClusters.isNotEmpty) {
+        // Sort clusters by size and average position
+        leftClusters.sort((a, b) => b.length.compareTo(a.length));
+        rightClusters.sort((a, b) => b.length.compareTo(a.length));
+
+        // Use the largest clusters
+        final leftX = leftClusters.first.reduce((a, b) => a + b) / leftClusters.first.length;
+        final rightX = rightClusters.first.reduce((a, b) => a + b) / rightClusters.first.length;
+
+        // Validate lane width
+        final laneWidth = rightX - leftX;
+        if (laneWidth > width * 0.2 && laneWidth < width * 0.9) {  // Expected lane width range
+          laneCenter = (leftX + rightX) / 2;
+          isValidLane = true;
+        } else {
+          laneCenter = centerX;
+        }
+      } else if (leftClusters.isNotEmpty) {
+        final leftX = leftClusters.first.reduce((a, b) => a + b) / leftClusters.first.length;
+        laneCenter = leftX + (width * 0.35);
+        isValidLane = leftClusters.first.length >= 3;  // Require more points for single-line detection
+      } else if (rightClusters.isNotEmpty) {
+        final rightX = rightClusters.first.reduce((a, b) => a + b) / rightClusters.first.length;
+        laneCenter = rightX - (width * 0.35);
+        isValidLane = rightClusters.first.length >= 3;  // Require more points for single-line detection
       } else {
-        laneCenter = rightLines[rightLines.length ~/ 2] - width * 0.25;
+        laneCenter = centerX;
       }
 
       // Draw guidance lines
@@ -185,14 +234,14 @@ class LaneDetector {
         thickness: 2
       );
 
-      // Calculate deviation
+      // Calculate deviation only if lane detection is valid
       double deviation = (laneCenter - centerX) / (width / 2);
       deviation = deviation.clamp(-1.0, 1.0);
 
       _lastResult = LaneDetectionResult(
         deviation,
         cv.imencode('.jpg', visualOutput).$2,
-        true
+        isValidLane
       );
       return _lastResult!;
 
@@ -221,4 +270,4 @@ class LaneDetector {
     _lastProcessTime = null;
     _frameCounter = 0;
   }
-} 
+}

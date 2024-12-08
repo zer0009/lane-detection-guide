@@ -48,6 +48,7 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
   Timer? _processingTimer;
   Uint8List? _processedImage;
   bool _isLaneDetected = false;
+  bool _isRunning = false;
 
   @override
   void initState() {
@@ -65,11 +66,33 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
   }
 
   void _startImageProcessing() {
-    _processingTimer = Timer.periodic(const Duration(milliseconds: 100), (_) async {
-      if (!isProcessing && mounted) {
-        await _processCurrentFrame();
+    if (_isRunning) return;
+    _isRunning = true;
+    LaneDetector.clearCache();
+    
+    _processingTimer = Timer.periodic(
+      const Duration(milliseconds: 150),
+      (_) async {
+        if (!isProcessing && mounted && _isRunning) {
+          await _processCurrentFrame();
+        }
       }
-    });
+    );
+  }
+
+  void _stopImageProcessing() {
+    _isRunning = false;
+    _processingTimer?.cancel();
+    _processingTimer = null;
+    _guidanceService.stop();
+    
+    if (mounted) {
+      setState(() {
+        _currentDeviation = 0.0;
+        _processedImage = null;
+        _isLaneDetected = false;
+      });
+    }
   }
 
   Future<void> _processCurrentFrame() async {
@@ -101,8 +124,8 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
 
   @override
   void dispose() {
+    _stopImageProcessing();
     LaneDetector.dispose();
-    _processingTimer?.cancel();
     _controller.dispose();
     super.dispose();
   }
@@ -112,6 +135,20 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Lane Detection Guide'),
+        actions: [
+          IconButton(
+            icon: Icon(_isRunning ? Icons.stop : Icons.play_arrow),
+            onPressed: () {
+              setState(() {
+                if (_isRunning) {
+                  _stopImageProcessing();
+                } else {
+                  _startImageProcessing();
+                }
+              });
+            },
+          ),
+        ],
       ),
       body: FutureBuilder<void>(
         future: _initializeControllerFuture,
