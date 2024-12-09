@@ -23,6 +23,12 @@ class LaneDetector {
   static DateTime? _lastProcessTime;
   static const Duration FORCE_PROCESS_INTERVAL = Duration(milliseconds: 500);
 
+  static const int HISTORY_SIZE = 5;
+  static List<double> _deviationHistory = [];
+  static List<bool> _detectionHistory = [];
+  static double _lastStableDeviation = 0.0;
+  static const double CONFIDENCE_THRESHOLD = 0.6;
+
   static cv.Mat _createROIMask(int width, int height) {
     if (_cachedMask != null && 
         _lastSize != null && 
@@ -89,39 +95,70 @@ class LaneDetector {
       resources.add(gray);
       
       // Apply blur and threshold in one step for better performance
-      final blurred = cv.gaussianBlur(gray, (5, 5), 1.5);  // Increased blur
-      resources.add(blurred);
+      final blurred = cv.gaussianBlur(gray, (5, 5), 1.5);
+      final adaptiveThresh = cv.adaptiveThreshold(
+        blurred,
+        255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY,
+        11,  // Block size
+        2    // C constant
+      );
+      resources.add(adaptiveThresh);
 
-      // Simplified edge detection with fixed thresholds for speed
-      final edges = cv.canny(blurred, 30, 90);  // Adjusted thresholds
+      // Use adaptive threshold result for edge detection
+      final edges = cv.canny(blurred, 50, 150);
       resources.add(edges);
+
+      // After creating resized image, add color-based detection
+      final hsv = cv.cvtColor(resized, cv.COLOR_BGR2HSV);
+      resources.add(hsv);
+
+      // Create masks for different common line colors (white, yellow)
+      final whiteMask = cv.inRange(
+        hsv,
+        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 180)),    // Low white in HSV
+        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 30, 255))  // High white in HSV
+      );
+
+      final yellowMask = cv.inRange(
+        hsv,
+        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(15, 80, 120)),   // Low yellow in HSV
+        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(35, 255, 255))   // High yellow in HSV
+      );
+
+      // Combine masks using bitwise operations
+      final combinedMask = cv.bitwiseOR(whiteMask, yellowMask);
+      resources.add(combinedMask);
+
+      // Enhanced edge detection with color information
+      final combinedEdges = cv.Mat.zeros(processHeight, processWidth, cv.MatType.CV_8UC1);
+      resources.add(combinedEdges);
+      
+      // Combine traditional edge detection with color information
+      final cannyEdges = cv.canny(cv.gaussianBlur(cv.cvtColor(resized, cv.COLOR_BGR2GRAY), (5, 5), 1.5), 30, 90);
+      cv.bitwiseOR(cannyEdges, combinedMask, dst: combinedEdges);
 
       // Apply ROI mask
       final mask = _createROIMask(processWidth, processHeight);
       final maskedEdges = cv.Mat.zeros(processHeight, processWidth, cv.MatType.CV_8UC1);
       resources.add(maskedEdges);
-      cv.bitwiseAND(edges, mask, dst: maskedEdges);
+      cv.bitwiseAND(combinedEdges, mask, dst: maskedEdges);
 
-      // Optimize Hough transform parameters
+      // Use probabilistic Hough transform with optimized parameters for curved lines
       final lines = cv.HoughLinesP(
         maskedEdges,
-        1.0,  // Reduced step size for better accuracy
-        pi / 180.0,
-        20,   // Increased threshold
-        minLineLength: 30.0,  // Longer minimum line length
-        maxLineGap: 50.0      // Reduced max gap
+        1.0,         // Distance resolution (pixels)
+        pi / 180.0,  // Angle resolution (radians)
+        15,          // Lower threshold for better detection of broken lines
+        minLineLength: 20.0,  // Shorter minimum length to catch curve segments
+        maxLineGap: 30.0      // Larger gap to connect broken segments
       );
-      resources.add(lines);
 
-      if (lines.rows < 2) {
-        _lastResult = LaneDetectionResult(0.0, imageBytes, false);
-        return _lastResult!;
-      }
-
-      // Enhanced line filtering and clustering
-      final List<List<double>> leftClusters = [];
-      final List<List<double>> rightClusters = [];
-      const double CLUSTER_THRESHOLD = 50.0; // pixels
+      // Enhanced line filtering and clustering for curves
+      final List<List<cv.Point>> leftSegments = [];
+      final List<List<cv.Point>> rightSegments = [];
+      const double CLUSTER_DISTANCE = 30.0; // pixels
       
       for (int i = 0; i < lines.rows; i++) {
         final line = lines.row(i);
@@ -130,72 +167,60 @@ class LaneDetector {
         final x2 = line.at<int>(0, 2).toDouble() / PROCESSING_SCALE;
         final y2 = line.at<int>(0, 3).toDouble() / PROCESSING_SCALE;
         
+        // Store actual points instead of just averages
+        final points = [cv.Point(x1.toInt(), y1.toInt()), cv.Point(x2.toInt(), y2.toInt())];
+        final avgX = (x1 + x2) / 2;
+        final avgY = (y1 + y2) / 2;
+        
+        // More flexible angle filtering for curves
         final dy = (y2 - y1);
         final dx = (x2 - x1);
         final angle = dy != 0 ? (dx / dy).abs() : double.infinity;
         
-        // Stricter angle filtering
-        if (angle > 0.3 && angle < 1.2) {  // Even narrower angle range
-          final avgX = (x1 + x2) / 2;
-          final avgY = (y1 + y2) / 2;
-          final lineLength = sqrt(dx * dx + dy * dy);
-          
-          // Only consider longer lines in the lower portion
-          if (avgY > height * 0.6 && lineLength > 30) {
-            bool addedToCluster = false;
-            
-            if (avgX < centerX) {
-              // Try to add to existing left clusters
-              for (var cluster in leftClusters) {
-                if ((cluster.reduce((a, b) => a + b) / cluster.length - avgX).abs() < CLUSTER_THRESHOLD) {
-                  cluster.add(avgX);
-                  addedToCluster = true;
-                  break;
-                }
-              }
-              if (!addedToCluster) {
-                leftClusters.add([avgX]);
-              }
-            } else {
-              // Try to add to existing right clusters
-              for (var cluster in rightClusters) {
-                if ((cluster.reduce((a, b) => a + b) / cluster.length - avgX).abs() < CLUSTER_THRESHOLD) {
-                  cluster.add(avgX);
-                  addedToCluster = true;
-                  break;
-                }
-              }
-              if (!addedToCluster) {
-                rightClusters.add([avgX]);
-              }
-            }
-
-            cv.line(
-              visualOutput,
-              cv.Point(x1.toInt(), y1.toInt()),
-              cv.Point(x2.toInt(), y2.toInt()),
-              avgX < centerX ? cv.Scalar(255, 0, 0) : cv.Scalar(0, 0, 255),
-              thickness: 2
-            );
+        if (angle < 2.0 && avgY > height * 0.5) {  // More permissive angle threshold
+          if (avgX < centerX) {
+            _addToSegmentCluster(leftSegments, points, CLUSTER_DISTANCE);
+          } else {
+            _addToSegmentCluster(rightSegments, points, CLUSTER_DISTANCE);
           }
+
+          // Visualize detected segments
+          cv.line(
+            visualOutput,
+            cv.Point(x1.toInt(), y1.toInt()),
+            cv.Point(x2.toInt(), y2.toInt()),
+            avgX < centerX ? cv.Scalar(255, 0, 0) : cv.Scalar(0, 0, 255),
+            thickness: 2
+          );
         }
       }
 
       // Filter out small clusters and calculate lane center
-      leftClusters.removeWhere((cluster) => cluster.length < 2);
-      rightClusters.removeWhere((cluster) => cluster.length < 2);
+      leftSegments.removeWhere((cluster) => cluster.length < 2);
+      rightSegments.removeWhere((cluster) => cluster.length < 2);
 
       double laneCenter;
       bool isValidLane = false;
 
-      if (leftClusters.isNotEmpty && rightClusters.isNotEmpty) {
-        // Sort clusters by size and average position
-        leftClusters.sort((a, b) => b.length.compareTo(a.length));
-        rightClusters.sort((a, b) => b.length.compareTo(a.length));
+      if (leftSegments.isNotEmpty && rightSegments.isNotEmpty) {
+        // Calculate weighted average based on segment point count
+        double leftX = 0;
+        double leftWeight = 0;
+        for (var segment in leftSegments.first) {
+          final weight = 1.0;  // Equal weight for each point
+          leftX += segment.x * weight;
+          leftWeight += weight;
+        }
+        leftX /= leftWeight;
 
-        // Use the largest clusters
-        final leftX = leftClusters.first.reduce((a, b) => a + b) / leftClusters.first.length;
-        final rightX = rightClusters.first.reduce((a, b) => a + b) / rightClusters.first.length;
+        double rightX = 0;
+        double rightWeight = 0;
+        for (var segment in rightSegments.first) {
+          final weight = 1.0;
+          rightX += segment.x * weight;
+          rightWeight += weight;
+        }
+        rightX /= rightWeight;
 
         // Validate lane width
         final laneWidth = rightX - leftX;
@@ -205,14 +230,22 @@ class LaneDetector {
         } else {
           laneCenter = centerX;
         }
-      } else if (leftClusters.isNotEmpty) {
-        final leftX = leftClusters.first.reduce((a, b) => a + b) / leftClusters.first.length;
+      } else if (leftSegments.isNotEmpty) {
+        double avgX = 0;
+        for (var point in leftSegments.first) {
+          avgX += point.x;
+        }
+        final leftX = avgX / leftSegments.first.length;
         laneCenter = leftX + (width * 0.35);
-        isValidLane = leftClusters.first.length >= 3;  // Require more points for single-line detection
-      } else if (rightClusters.isNotEmpty) {
-        final rightX = rightClusters.first.reduce((a, b) => a + b) / rightClusters.first.length;
+        isValidLane = leftSegments.first.length >= 3;
+      } else if (rightSegments.isNotEmpty) {
+        double avgX = 0;
+        for (var point in rightSegments.first) {
+          avgX += point.x;
+        }
+        final rightX = avgX / rightSegments.first.length;
         laneCenter = rightX - (width * 0.35);
-        isValidLane = rightClusters.first.length >= 3;  // Require more points for single-line detection
+        isValidLane = rightSegments.first.length >= 3;
       } else {
         laneCenter = centerX;
       }
@@ -238,10 +271,48 @@ class LaneDetector {
       double deviation = (laneCenter - centerX) / (width / 2);
       deviation = deviation.clamp(-1.0, 1.0);
 
+      // Calculate confidence score based on number of segments
+      double confidence = 0.0;
+      if (leftSegments.isNotEmpty && rightSegments.isNotEmpty) {
+        confidence = min(1.0, (leftSegments.first.length + rightSegments.first.length) / 10.0);
+      } else if (leftSegments.isNotEmpty || rightSegments.isNotEmpty) {
+        confidence = min(0.7, (leftSegments.isEmpty ? rightSegments.first.length : leftSegments.first.length) / 8.0);
+      }
+
+      // Apply temporal smoothing
+      _deviationHistory.add(deviation);
+      _detectionHistory.add(isValidLane && confidence > CONFIDENCE_THRESHOLD);
+      
+      if (_deviationHistory.length > HISTORY_SIZE) {
+        _deviationHistory.removeAt(0);
+        _detectionHistory.removeAt(0);
+      }
+
+      // Calculate smoothed values
+      if (_deviationHistory.isNotEmpty) {
+        double sum = 0;
+        int validCount = 0;
+        
+        for (int i = 0; i < _deviationHistory.length; i++) {
+          if (_detectionHistory[i]) {
+            sum += _deviationHistory[i];
+            validCount++;
+          }
+        }
+
+        if (validCount > 0) {
+          deviation = sum / validCount;
+          _lastStableDeviation = deviation;
+        } else {
+          deviation = _lastStableDeviation;
+          isValidLane = false;
+        }
+      }
+
       _lastResult = LaneDetectionResult(
         deviation,
         cv.imencode('.jpg', visualOutput).$2,
-        isValidLane
+        isValidLane && confidence > CONFIDENCE_THRESHOLD
       );
       return _lastResult!;
 
@@ -257,6 +328,34 @@ class LaneDetector {
     }
   }
 
+  // Add new helper method for segment clustering
+  static void _addToSegmentCluster(List<List<cv.Point>> clusters, List<cv.Point> points, double threshold) {
+    bool addedToCluster = false;
+    
+    for (var cluster in clusters) {
+      // Check if any point in the new segment is close to any point in the cluster
+      for (var newPoint in points) {
+        for (var clusterPoint in cluster) {
+          final dx = newPoint.x - clusterPoint.x;
+          final dy = newPoint.y - clusterPoint.y;
+          final distance = sqrt(dx * dx + dy * dy);
+          
+          if (distance < threshold) {
+            cluster.addAll(points);
+            addedToCluster = true;
+            break;
+          }
+        }
+        if (addedToCluster) break;
+      }
+      if (addedToCluster) break;
+    }
+    
+    if (!addedToCluster) {
+      clusters.add(points);
+    }
+  }
+
   static void dispose() {
     _cachedMask?.dispose();
     _cachedMask = null;
@@ -269,5 +368,8 @@ class LaneDetector {
     _lastResult = null;
     _lastProcessTime = null;
     _frameCounter = 0;
+    _deviationHistory.clear();
+    _detectionHistory.clear();
+    _lastStableDeviation = 0.0;
   }
 }
