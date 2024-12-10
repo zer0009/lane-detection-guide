@@ -154,20 +154,20 @@ class LaneDetector {
       resources.add(maskedEdges);
       cv.bitwiseAND(combinedEdges, mask, dst: maskedEdges);
 
-      // Use probabilistic Hough transform with optimized parameters for curved lines
+      // Use probabilistic Hough transform with stricter parameters
       final lines = cv.HoughLinesP(
         maskedEdges,
-        1.0,         // Distance resolution (pixels)
-        pi / 180.0,  // Angle resolution (radians)
-        15,          // Lower threshold for better detection of broken lines
-        minLineLength: 20.0,  // Shorter minimum length to catch curve segments
-        maxLineGap: 30.0      // Larger gap to connect broken segments
+        1.0,         
+        pi / 180.0,  
+        25,          // Increased threshold for more confident line detection
+        minLineLength: 30.0,  // Increased minimum length
+        maxLineGap: 20.0      // Reduced gap to avoid connecting unrelated segments
       );
 
-      // Enhanced line filtering and clustering for curves
+      // Enhanced line filtering with stricter criteria
       final List<List<cv.Point>> leftSegments = [];
       final List<List<cv.Point>> rightSegments = [];
-      const double CLUSTER_DISTANCE = 30.0; // pixels
+      const double CLUSTER_DISTANCE = 20.0; // Reduced clustering distance
       
       for (int i = 0; i < lines.rows; i++) {
         final line = lines.row(i);
@@ -176,20 +176,25 @@ class LaneDetector {
         final x2 = line.at<int>(0, 2).toDouble() / PROCESSING_SCALE;
         final y2 = line.at<int>(0, 3).toDouble() / PROCESSING_SCALE;
         
-        // Store actual points instead of just averages
         final points = [cv.Point(x1.toInt(), y1.toInt()), cv.Point(x2.toInt(), y2.toInt())];
         final avgX = (x1 + x2) / 2;
         final avgY = (y1 + y2) / 2;
         
-        // More flexible angle filtering for curves
+        // Stricter angle and position filtering
         final dy = (y2 - y1);
         final dx = (x2 - x1);
         final angle = dy != 0 ? (dx / dy).abs() : double.infinity;
+        final length = sqrt(dx * dx + dy * dy);
         
-        if (angle < 2.0 && avgY > height * 0.5) {  // More permissive angle threshold
-          if (avgX < centerX) {
+        // More restrictive conditions for valid lane lines
+        if (angle < 1.5 && // Stricter angle threshold
+            length > height * 0.15 && // Minimum length requirement
+            avgY > height * 0.6 && // Only consider lower portion of image
+            avgY < height * 0.95) { // Ignore lines too close to bottom
+          
+          if (avgX < centerX && avgX > width * 0.1) { // Left lane boundary
             _addToSegmentCluster(leftSegments, points, CLUSTER_DISTANCE);
-          } else {
+          } else if (avgX > centerX && avgX < width * 0.9) { // Right lane boundary
             _addToSegmentCluster(rightSegments, points, CLUSTER_DISTANCE);
           }
 
@@ -231,13 +236,14 @@ class LaneDetector {
         }
         rightX /= rightWeight;
 
-        // Validate lane width
+        // Stricter validation criteria for lane detection
         final laneWidth = rightX - leftX;
-        if (laneWidth > width * 0.2 && laneWidth < width * 0.9) {  // Expected lane width range
+        if (laneWidth > width * 0.3 && laneWidth < width * 0.8) {  // Stricter lane width range
           laneCenter = (leftX + rightX) / 2;
-          isValidLane = true;
+          isValidLane = leftSegments.first.length >= 4 && rightSegments.first.length >= 4; // Require more points
         } else {
           laneCenter = centerX;
+          isValidLane = false;
         }
       } else if (leftSegments.isNotEmpty) {
         double avgX = 0;
