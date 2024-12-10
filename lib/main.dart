@@ -5,6 +5,13 @@ import 'dart:typed_data';
 import 'lane_detector.dart';
 import 'guidance_service.dart';
 import 'lane_guide_painter.dart';
+import 'package:flutter/services.dart';
+
+class Constants {
+  static const processingInterval = Duration(milliseconds: 150);
+  static const deviationThreshold = 0.1;
+  static const guidanceTextSize = 24.0;
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -73,7 +80,7 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
     _processingTimer = Timer.periodic(
       const Duration(milliseconds: 150),
       (_) async {
-        if (!isProcessing && mounted && _isRunning) {
+        if (_shouldProcessFrame()) {
           await _processCurrentFrame();
         }
       }
@@ -122,11 +129,26 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
     }
   }
 
+  bool _shouldProcessFrame() {
+    return !isProcessing && mounted && _isRunning;
+  }
+
+  void _provideHapticFeedback() {
+    HapticFeedback.mediumImpact();
+  }
+
+  void _configureCameraSettings() {
+    _controller.setFlashMode(FlashMode.off);
+    _controller.setExposureMode(ExposureMode.auto);
+    _controller.setFocusMode(FocusMode.auto);
+  }
+
   @override
   void dispose() {
     _stopImageProcessing();
     LaneDetector.dispose();
     _controller.dispose();
+    _processedImage = null;
     super.dispose();
   }
 
@@ -160,12 +182,7 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
-                      _processedImage != null
-                          ? Image.memory(
-                              _processedImage!,
-                              fit: BoxFit.cover,
-                            )
-                          : CameraPreview(_controller),
+                      _buildImageDisplay(),
                       CustomPaint(
                         painter: LaneGuidePainter(_currentDeviation),
                       ),
@@ -193,6 +210,19 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
         },
       ),
     );
+  }
+
+  Widget _buildImageDisplay() {
+    if (_processedImage != null) {
+      return Stack(
+        children: [
+          Image.memory(_processedImage!, fit: BoxFit.cover),
+          if (isProcessing)
+            const Center(child: CircularProgressIndicator()),
+        ],
+      );
+    }
+    return CameraPreview(_controller);
   }
 
   String _getGuidanceText() {

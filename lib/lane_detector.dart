@@ -16,12 +16,12 @@ class LaneDetector {
   static cv.Size? _lastSize;
   
   // Increase frame skipping and reduce processing size for better performance
-  static const double PROCESSING_SCALE = 0.25; // Reduce to 25% of original size
-  static const int SKIP_FRAMES = 3; // Process every 4th frame
+  static const double PROCESSING_SCALE = 0.2; // Reduce to 20% for better performance
+  static const int SKIP_FRAMES = 4; // Process every 5th frame
   static int _frameCounter = 0;
   static LaneDetectionResult? _lastResult;
   static DateTime? _lastProcessTime;
-  static const Duration FORCE_PROCESS_INTERVAL = Duration(milliseconds: 500);
+  static const Duration FORCE_PROCESS_INTERVAL = Duration(milliseconds: 750);
 
   static const int HISTORY_SIZE = 5;
   static List<double> _deviationHistory = [];
@@ -114,7 +114,7 @@ class LaneDetector {
       final hsv = cv.cvtColor(resized, cv.COLOR_BGR2HSV);
       resources.add(hsv);
 
-      // Create masks for different common line colors (white, yellow)
+      // Create masks for different line colors (white, yellow, black)
       final whiteMask = cv.inRange(
         hsv,
         cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 180)),    // Low white in HSV
@@ -127,8 +127,17 @@ class LaneDetector {
         cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(35, 255, 255))   // High yellow in HSV
       );
 
-      // Combine masks using bitwise operations
-      final combinedMask = cv.bitwiseOR(whiteMask, yellowMask);
+      final blackMask = cv.inRange(
+        hsv,
+        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 0)),      // Low black in HSV
+        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 255, 50))  // High black in HSV
+      );
+
+      // Combine all masks using bitwise operations
+      final combinedMask = cv.bitwiseOR(
+        cv.bitwiseOR(whiteMask, yellowMask),
+        blackMask
+      );
       resources.add(combinedMask);
 
       // Enhanced edge detection with color information
@@ -371,5 +380,44 @@ class LaneDetector {
     _deviationHistory.clear();
     _detectionHistory.clear();
     _lastStableDeviation = 0.0;
+  }
+
+  // Enhanced adaptive thresholding based on lighting conditions
+  static double _calculateThreshold(cv.Mat gray) {
+    final mean = cv.mean(gray);
+    final stdDev = cv.meanStdDev(gray);
+    
+    // Get the mean brightness (first channel)
+    final meanBrightness = mean.val[0];
+    
+    // Get the standard deviation value
+    final standardDeviation = stdDev.$2.val[0];
+    
+    // Base threshold calculation using mean brightness
+    double baseThreshold = meanBrightness < 127 ? 30.0 : 50.0;
+    
+    // Adjust threshold based on image contrast (standard deviation)
+    if (standardDeviation < 30) {
+      // Low contrast image - reduce threshold
+      baseThreshold *= 0.8;
+    } else if (standardDeviation > 60) {
+      // High contrast image - increase threshold
+      baseThreshold *= 1.2;
+    }
+    
+    // Ensure threshold stays within reasonable bounds
+    return baseThreshold.clamp(20.0, 70.0);
+  }
+
+  // Improve line filtering
+  static bool _isValidLine(double x1, double y1, double x2, double y2, int width, int height) {
+    final dy = (y2 - y1);
+    final dx = (x2 - x1);
+    final angle = dy != 0 ? (dx / dy).abs() : double.infinity;
+    final length = sqrt(dx * dx + dy * dy);
+    
+    return angle < 2.5 && // More permissive angle
+           length > height * 0.1 && // Minimum length
+           length < height * 0.8;   // Maximum length
   }
 }
