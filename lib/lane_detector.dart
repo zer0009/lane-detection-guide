@@ -1,7 +1,8 @@
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'dart:typed_data';
 import 'dart:math' show pi, min, max, sqrt;
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show compute, debugPrint;
+import 'dart:async';
 
 class LaneDetectionResult {
   final double deviation;
@@ -15,19 +16,24 @@ class LaneDetector {
   static cv.Mat? _cachedMask;
   static cv.Size? _lastSize;
   
-  // Increase frame skipping and reduce processing size for better performance
-  static const double PROCESSING_SCALE = 0.2; // Reduce to 20% for better performance
-  static const int SKIP_FRAMES = 4; // Process every 5th frame
+  // Adjust these constants for better performance/accuracy balance
+  static const double PROCESSING_SCALE = 0.25; // Increased from 0.2 for better accuracy
+  static const int SKIP_FRAMES = 3; // Reduced from 4 for more frequent updates
   static int _frameCounter = 0;
   static LaneDetectionResult? _lastResult;
   static DateTime? _lastProcessTime;
-  static const Duration FORCE_PROCESS_INTERVAL = Duration(milliseconds: 750);
+  static const Duration FORCE_PROCESS_INTERVAL = Duration(milliseconds: 500); // Reduced from 750ms
 
   static const int HISTORY_SIZE = 5;
   static List<double> _deviationHistory = [];
   static List<bool> _detectionHistory = [];
   static double _lastStableDeviation = 0.0;
   static const double CONFIDENCE_THRESHOLD = 0.6;
+
+  // Add new constants for improved line detection
+  static const double MIN_LINE_LENGTH_RATIO = 0.12; // Minimum line length as ratio of height
+  static const double MAX_LINE_LENGTH_RATIO = 0.7;  // Maximum line length as ratio of height
+  static const double MIN_CONFIDENCE_POINTS = 3;    // Minimum points needed for confidence
 
   static cv.Mat _createROIMask(int width, int height) {
     if (_cachedMask != null && 
@@ -110,27 +116,22 @@ class LaneDetector {
       final edges = cv.canny(blurred, 50, 150);
       resources.add(edges);
 
-      // After creating resized image, add color-based detection
+      // Replace parallel processing with sequential processing
       final hsv = cv.cvtColor(resized, cv.COLOR_BGR2HSV);
       resources.add(hsv);
 
-      // Create masks for different line colors (white, yellow, black)
-      final whiteMask = cv.inRange(
-        hsv,
-        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 180)),    // Low white in HSV
-        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 30, 255))  // High white in HSV
-      );
+      // Create color masks sequentially instead of parallel
+      final whiteMask = _createColorMask(hsv, 'white');
+      final yellowMask = _createColorMask(hsv, 'yellow');
+      final blackMask = _createColorMask(hsv, 'black');
+      
+      resources.addAll([whiteMask, yellowMask, blackMask]);
 
-      final yellowMask = cv.inRange(
-        hsv,
-        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(15, 80, 120)),   // Low yellow in HSV
-        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(35, 255, 255))   // High yellow in HSV
-      );
-
-      final blackMask = cv.inRange(
-        hsv,
-        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 0)),      // Low black in HSV
-        cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 255, 50))  // High black in HSV
+      // Improve edge detection parameters
+      final cannyEdges = cv.canny(
+        cv.gaussianBlur(cv.cvtColor(resized, cv.COLOR_BGR2GRAY), (5, 5), 1.5),
+        20, // Lower threshold for better edge detection
+        100  // Upper threshold
       );
 
       // Combine all masks using bitwise operations
@@ -145,7 +146,6 @@ class LaneDetector {
       resources.add(combinedEdges);
       
       // Combine traditional edge detection with color information
-      final cannyEdges = cv.canny(cv.gaussianBlur(cv.cvtColor(resized, cv.COLOR_BGR2GRAY), (5, 5), 1.5), 30, 90);
       cv.bitwiseOR(cannyEdges, combinedMask, dst: combinedEdges);
 
       // Apply ROI mask
@@ -286,13 +286,24 @@ class LaneDetector {
       double deviation = (laneCenter - centerX) / (width / 2);
       deviation = deviation.clamp(-1.0, 1.0);
 
-      // Calculate confidence score based on number of segments
-      double confidence = 0.0;
-      if (leftSegments.isNotEmpty && rightSegments.isNotEmpty) {
-        confidence = min(1.0, (leftSegments.first.length + rightSegments.first.length) / 10.0);
-      } else if (leftSegments.isNotEmpty || rightSegments.isNotEmpty) {
-        confidence = min(0.7, (leftSegments.isEmpty ? rightSegments.first.length : leftSegments.first.length) / 8.0);
+      // Enhanced confidence calculation
+      double calculateConfidence(List<List<cv.Point>> segments) {
+        if (segments.isEmpty) return 0.0;
+        
+        final points = segments.first.length;
+        final avgLength = _calculateAverageSegmentLength(segments.first);
+        
+        return min(1.0, (points / MIN_CONFIDENCE_POINTS) * 
+                       (avgLength / (height * MIN_LINE_LENGTH_RATIO)));
       }
+
+      // Calculate confidence for both sides
+      final leftConfidence = calculateConfidence(leftSegments);
+      final rightConfidence = calculateConfidence(rightSegments);
+      
+      // Use weighted confidence for final detection
+      final confidence = (leftConfidence + rightConfidence) / 2;
+      isValidLane = confidence > CONFIDENCE_THRESHOLD;
 
       // Apply temporal smoothing
       _deviationHistory.add(deviation);
@@ -425,5 +436,45 @@ class LaneDetector {
     return angle < 2.5 && // More permissive angle
            length > height * 0.1 && // Minimum length
            length < height * 0.8;   // Maximum length
+  }
+
+  // Modified color mask creation method
+  static cv.Mat _createColorMask(cv.Mat hsv, String type) {
+    switch (type) {
+      case 'white':
+        return cv.inRange(
+          hsv,
+          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 200)),    // Adjusted white threshold
+          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 25, 255))
+        );
+      case 'yellow':
+        return cv.inRange(
+          hsv,
+          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(15, 100, 120)),  // Adjusted yellow threshold
+          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(35, 255, 255))
+        );
+      case 'black':
+        return cv.inRange(
+          hsv,
+          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 0)),
+          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 255, 40))   // Adjusted black threshold
+        );
+      default:
+        throw Exception('Invalid color mask type');
+    }
+  }
+
+  // New helper method for segment length calculation
+  static double _calculateAverageSegmentLength(List<cv.Point> points) {
+    if (points.length < 2) return 0.0;
+    
+    double totalLength = 0.0;
+    for (int i = 0; i < points.length - 1; i++) {
+      final dx = points[i + 1].x - points[i].x;
+      final dy = points[i + 1].y - points[i].y;
+      totalLength += sqrt(dx * dx + dy * dy);
+    }
+    
+    return totalLength / (points.length - 1);
   }
 }
