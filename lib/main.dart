@@ -2,19 +2,26 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'dart:async';
 import 'dart:typed_data';
+import 'package:flutter/services.dart';
 import 'lane_detector.dart';
 import 'guidance_service.dart';
 import 'lane_guide_painter.dart';
-import 'package:flutter/services.dart';
 
 class Constants {
-  static const processingInterval = Duration(milliseconds: 150);
+  static const processingInterval = Duration(milliseconds: 100); // Faster processing
   static const deviationThreshold = 0.1;
   static const guidanceTextSize = 24.0;
+  static const maxFPS = 30; // Limit FPS for better performance
 }
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  
+  // Lock to portrait orientation
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
+  
   final cameras = await availableCameras();
   runApp(MyApp(camera: cameras.first));
 }
@@ -27,9 +34,14 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Blind Runner Guide',
+      title: 'Lane Detection Guide',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        brightness: Brightness.dark,
+        colorScheme: ColorScheme.dark(
+          primary: Colors.blue,
+          secondary: Colors.blueAccent,
+        ),
         useMaterial3: true,
       ),
       home: LaneDetectionScreen(camera: camera),
@@ -46,29 +58,40 @@ class LaneDetectionScreen extends StatefulWidget {
   State<LaneDetectionScreen> createState() => _LaneDetectionScreenState();
 }
 
-class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
+class _LaneDetectionScreenState extends State<LaneDetectionScreen> with WidgetsBindingObserver {
   late CameraController _controller;
   late Future<void> _initializeControllerFuture;
-  bool isProcessing = false;
+  bool _isProcessing = false;
   final GuidanceService _guidanceService = GuidanceService();
   double _currentDeviation = 0.0;
   Timer? _processingTimer;
   Uint8List? _processedImage;
   bool _isLaneDetected = false;
   bool _isRunning = false;
+  DateTime? _lastFrameTime;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initializeCamera();
+  }
+
+  Future<void> _initializeCamera() async {
     _controller = CameraController(
       widget.camera,
       ResolutionPreset.medium,
       enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.jpeg,
     );
+
     _initializeControllerFuture = _controller.initialize().then((_) {
       if (mounted) {
+        _configureCameraSettings();
         _startImageProcessing();
       }
+    }).catchError((error) {
+      print('Camera initialization error: $error');
     });
   }
 
@@ -78,13 +101,66 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
     LaneDetector.clearCache();
     
     _processingTimer = Timer.periodic(
-      const Duration(milliseconds: 150),
-      (_) async {
-        if (_shouldProcessFrame()) {
-          await _processCurrentFrame();
+      Constants.processingInterval,
+      (_) => _processNextFrameIfReady()
+    );
+  }
+
+  Future<void> _processNextFrameIfReady() async {
+    // Implement frame rate limiting
+    if (_lastFrameTime != null) {
+      final elapsed = DateTime.now().difference(_lastFrameTime!);
+      if (elapsed.inMilliseconds < (1000 / Constants.maxFPS)) {
+        return;
+      }
+    }
+    
+    if (!_isProcessing && mounted && _isRunning) {
+      await _processCurrentFrame();
+    }
+  }
+
+  Future<void> _processCurrentFrame() async {
+    if (!_controller.value.isInitialized) return;
+    
+    _isProcessing = true;
+    _lastFrameTime = DateTime.now();
+    
+    try {
+      final image = await _controller.takePicture();
+      final imageBytes = await image.readAsBytes();
+      
+      final result = await LaneDetector.processFrame(imageBytes);
+      
+      if (mounted) {
+        setState(() {
+          _currentDeviation = result.deviation;
+          _processedImage = result.processedImage;
+          _isLaneDetected = result.isLaneDetected;
+        });
+        
+        if (_isLaneDetected) {
+          await _guidanceService.provideGuidance(result.deviation);
+          _provideHapticFeedback(result.deviation);
         }
       }
-    );
+    } catch (e) {
+      debugPrint('Error processing frame: $e');
+    } finally {
+      _isProcessing = false;
+    }
+  }
+
+  void _provideHapticFeedback(double deviation) {
+    if (deviation.abs() > Constants.deviationThreshold) {
+      HapticFeedback.mediumImpact();
+    }
+  }
+
+  void _configureCameraSettings() {
+    _controller.setFlashMode(FlashMode.off);
+    _controller.setExposureMode(ExposureMode.auto);
+    _controller.setFocusMode(FocusMode.auto);
   }
 
   void _stopImageProcessing() {
@@ -102,52 +178,29 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
     }
   }
 
-  Future<void> _processCurrentFrame() async {
-    if (!_controller.value.isInitialized) return;
-    
-    isProcessing = true;
-    try {
-      final image = await _controller.takePicture();
-      final imageBytes = await image.readAsBytes();
-      
-      final result = await LaneDetector.processFrame(imageBytes);
-      
-      if (mounted) {
-        setState(() {
-          _currentDeviation = result.deviation;
-          _processedImage = result.processedImage;
-          _isLaneDetected = result.isLaneDetected;
-        });
-        if (_isLaneDetected) {
-          await _guidanceService.provideGuidance(result.deviation);
-        }
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_controller.value.isInitialized) {
+      switch (state) {
+        case AppLifecycleState.paused:
+          _stopImageProcessing();
+          break;
+        case AppLifecycleState.resumed:
+          _startImageProcessing();
+          break;
+        default:
+          break;
       }
-    } catch (e) {
-      debugPrint('Error processing frame: $e');
-    } finally {
-      isProcessing = false;
     }
-  }
-
-  bool _shouldProcessFrame() {
-    return !isProcessing && mounted && _isRunning;
-  }
-
-  void _provideHapticFeedback() {
-    HapticFeedback.mediumImpact();
-  }
-
-  void _configureCameraSettings() {
-    _controller.setFlashMode(FlashMode.off);
-    _controller.setExposureMode(ExposureMode.auto);
-    _controller.setFocusMode(FocusMode.auto);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _stopImageProcessing();
     LaneDetector.dispose();
     _controller.dispose();
+    _guidanceService.dispose();
     _processedImage = null;
     super.dispose();
   }
@@ -176,34 +229,7 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
         future: _initializeControllerFuture,
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.done) {
-            return Column(
-              children: [
-                Expanded(
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      _buildImageDisplay(),
-                      CustomPaint(
-                        painter: LaneGuidePainter(_currentDeviation),
-                      ),
-                    ],
-                  ),
-                ),
-                Container(
-                  height: 100,
-                  color: Colors.black87,
-                  child: Center(
-                    child: Text(
-                      _getGuidanceText(),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 24,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            );
+            return _buildMainContent();
           } else {
             return const Center(child: CircularProgressIndicator());
           }
@@ -212,26 +238,67 @@ class _LaneDetectionScreenState extends State<LaneDetectionScreen> {
     );
   }
 
+  Widget _buildMainContent() {
+    return Column(
+      children: [
+        Expanded(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              _buildImageDisplay(),
+              CustomPaint(
+                painter: LaneGuidePainter(_currentDeviation),
+              ),
+              if (_isProcessing)
+                const Positioned(
+                  top: 10,
+                  right: 10,
+                  child: CircularProgressIndicator(),
+                ),
+            ],
+          ),
+        ),
+        _buildGuidanceBar(),
+      ],
+    );
+  }
+
   Widget _buildImageDisplay() {
     if (_processedImage != null) {
-      return Stack(
-        children: [
-          Image.memory(_processedImage!, fit: BoxFit.cover),
-          if (isProcessing)
-            const Center(child: CircularProgressIndicator()),
-        ],
+      return Image.memory(
+        _processedImage!,
+        fit: BoxFit.cover,
+        gaplessPlayback: true, // Prevents flickering
       );
     }
     return CameraPreview(_controller);
   }
 
+  Widget _buildGuidanceBar() {
+    return Container(
+      height: 100,
+      color: Colors.black87,
+      child: Center(
+        child: Text(
+          _getGuidanceText(),
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: Constants.guidanceTextSize,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
+    );
+  }
+
   String _getGuidanceText() {
-    if (_currentDeviation.abs() < 0.1) {
+    if (!_isLaneDetected) {
+      return 'No Lane Detected';
+    }
+    if (_currentDeviation.abs() < Constants.deviationThreshold) {
       return 'Centered';
-    } else if (_currentDeviation > 0) {
-      return 'Move Left';
     } else {
-      return 'Move Right';
+      return _currentDeviation > 0 ? 'Move Left' : 'Move Right';
     }
   }
 }

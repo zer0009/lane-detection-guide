@@ -440,27 +440,51 @@ class LaneDetector {
 
   // Modified color mask creation method
   static cv.Mat _createColorMask(cv.Mat hsv, String type) {
-    switch (type) {
-      case 'white':
-        return cv.inRange(
-          hsv,
-          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 200)),    // Adjusted white threshold
-          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 25, 255))
-        );
-      case 'yellow':
-        return cv.inRange(
-          hsv,
-          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(15, 100, 120)),  // Adjusted yellow threshold
-          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(35, 255, 255))
-        );
-      case 'black':
-        return cv.inRange(
-          hsv,
-          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 0)),
-          cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 255, 40))   // Adjusted black threshold
-        );
-      default:
-        throw Exception('Invalid color mask type');
+    final mask = cv.Mat.zeros(hsv.rows, hsv.cols, cv.MatType.CV_8UC1);
+    
+    try {
+      switch (type) {
+        case 'white':
+          // Improved white detection by considering both value and saturation
+          final lowerWhite = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 215));
+          final upperWhite = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 30, 255));
+          cv.inRange(hsv, lowerWhite, upperWhite, dst: mask);
+          lowerWhite.dispose();
+          upperWhite.dispose();
+          break;
+
+        case 'yellow':
+          // Wider range for yellow detection with higher minimum saturation
+          final lowerYellow = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(15, 120, 120));
+          final upperYellow = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(40, 255, 255));
+          cv.inRange(hsv, lowerYellow, upperYellow, dst: mask);
+          lowerYellow.dispose();
+          upperYellow.dispose();
+          break;
+
+        case 'black':
+          // Improved black detection focusing on low value pixels
+          final lowerBlack = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 0));
+          final upperBlack = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 255, 50));
+          cv.inRange(hsv, lowerBlack, upperBlack, dst: mask);
+          lowerBlack.dispose();
+          upperBlack.dispose();
+          break;
+
+        default:
+          throw Exception('Invalid color mask type');
+      }
+
+      // Apply morphological operations to reduce noise
+      final kernel = cv.getStructuringElement(cv.MORPH_RECT, (3, 3));
+      cv.morphologyEx(mask, cv.MORPH_OPEN, kernel, dst: mask);
+      cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel, dst: mask);
+      kernel.dispose();
+
+      return mask;
+    } catch (e) {
+      mask.dispose();
+      rethrow;
     }
   }
 
