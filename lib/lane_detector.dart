@@ -1,15 +1,35 @@
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'dart:typed_data';
-import 'dart:math' show pi, min, max, sqrt;
+import 'dart:math' show atan2, cos, max, min, pi, sqrt;
 import 'package:flutter/foundation.dart' show compute, debugPrint;
 import 'dart:async';
+
+class CameraParameters {
+  final double focalLength;
+  final cv.Point principalPoint;
+  final double height;
+
+  CameraParameters({
+    required this.focalLength,
+    required this.principalPoint,
+    required this.height,
+  });
+}
 
 class LaneDetectionResult {
   final double deviation;
   final Uint8List processedImage;
   final bool isLaneDetected;
+  final double lateralOffset; // Meters from lane center (negative = left)
+  final double orientation; // Degrees from straight ahead
 
-  LaneDetectionResult(this.deviation, this.processedImage, this.isLaneDetected);
+  LaneDetectionResult(
+    this.deviation, 
+    this.processedImage, 
+    this.isLaneDetected, {
+    this.lateralOffset = 0.0,
+    this.orientation = 0.0,
+  });
 }
 
 class LaneDetector {
@@ -17,14 +37,14 @@ class LaneDetector {
   static cv.Size? _lastSize;
   
   // Adjust these constants for better performance/accuracy balance
-  static const double PROCESSING_SCALE = 0.25; // Increased from 0.2 for better accuracy
-  static const int SKIP_FRAMES = 3; // Reduced from 4 for more frequent updates
+  static const double PROCESSING_SCALE = 0.2; // Reduced scale for faster processing
+  static const int SKIP_FRAMES = 2; // Process more frames
   static int _frameCounter = 0;
   static LaneDetectionResult? _lastResult;
   static DateTime? _lastProcessTime;
-  static const Duration FORCE_PROCESS_INTERVAL = Duration(milliseconds: 500); // Reduced from 750ms
+  static const Duration FORCE_PROCESS_INTERVAL = Duration(milliseconds: 250); // Faster updates
 
-  static const int HISTORY_SIZE = 5;
+  static const int HISTORY_SIZE = 3; // Reduced history size for faster response
   static List<double> _deviationHistory = [];
   static List<bool> _detectionHistory = [];
   static double _lastStableDeviation = 0.0;
@@ -34,6 +54,19 @@ class LaneDetector {
   static const double MIN_LINE_LENGTH_RATIO = 0.12; // Minimum line length as ratio of height
   static const double MAX_LINE_LENGTH_RATIO = 0.7;  // Maximum line length as ratio of height
   static const double MIN_CONFIDENCE_POINTS = 3;    // Minimum points needed for confidence
+
+  // Add new constants for lane tracking
+  static const double LANE_WIDTH_METERS = 3.7; // Standard lane width in meters
+  static const double TYPICAL_CAMERA_HEIGHT = 1.5; // Typical phone height in meters
+  static double? _lastValidLaneWidth; // Store last known good lane width in pixels
+  static cv.Point? _lastValidVanishingPoint; // Track vanishing point for orientation
+  
+  // Add camera calibration parameters
+  static final _cameraParams = CameraParameters(
+    focalLength: 1000.0, // Approximate focal length in pixels
+    principalPoint: cv.Point(0, 0), // Will be set based on image size
+    height: TYPICAL_CAMERA_HEIGHT,
+  );
 
   static cv.Mat _createROIMask(int width, int height) {
     if (_cachedMask != null && 
@@ -62,7 +95,7 @@ class LaneDetector {
   }
 
   static Future<LaneDetectionResult> processFrame(Uint8List imageBytes) async {
-    // Skip frames but ensure we process at least every 500ms
+    // Optimize frame processing logic
     _frameCounter = (_frameCounter + 1) % (SKIP_FRAMES + 1);
     final now = DateTime.now();
     final shouldForceProcess = _lastProcessTime == null || 
@@ -76,92 +109,61 @@ class LaneDetector {
     final List<cv.Mat> resources = [];
     
     try {
-      // Convert image bytes to Mat
+      // Optimize image processing pipeline
       final img = cv.imdecode(imageBytes, cv.IMREAD_COLOR);
       resources.add(img);
       
       final height = img.rows;
       final width = img.cols;
-      
-      // Define center X coordinate
       final centerX = width / 2;
 
-      // Resize image for faster processing
+      // Smaller processing size
       final processWidth = (width * PROCESSING_SCALE).toInt();
       final processHeight = (height * PROCESSING_SCALE).toInt();
       final resized = cv.resize(img, (processWidth, processHeight));
       resources.add(resized);
 
-      // Create visualization output (only if needed)
-      final visualOutput = img.clone();
+      // Create visualization output with lower quality for better performance
+      final visualOutput = cv.resize(img, (width ~/ 1.5, height ~/ 1.5)); // Reduced output size
       resources.add(visualOutput);
 
-      // Convert to grayscale
+      // Optimize color conversion and edge detection
       final gray = cv.cvtColor(resized, cv.COLOR_BGR2GRAY);
       resources.add(gray);
       
-      // Apply blur and threshold in one step for better performance
-      final blurred = cv.gaussianBlur(gray, (5, 5), 1.5);
-      final adaptiveThresh = cv.adaptiveThreshold(
-        blurred,
-        255,
-        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv.THRESH_BINARY,
-        11,  // Block size
-        2    // C constant
-      );
-      resources.add(adaptiveThresh);
-
-      // Use adaptive threshold result for edge detection
-      final edges = cv.canny(blurred, 50, 150);
+      // Simplified edge detection
+      final blurred = cv.gaussianBlur(gray, (3, 3), 1.0); // Smaller kernel
+      final edges = cv.canny(blurred, 50, 150, apertureSize: 3);
       resources.add(edges);
 
-      // Replace parallel processing with sequential processing
+      // Simplified color detection
       final hsv = cv.cvtColor(resized, cv.COLOR_BGR2HSV);
       resources.add(hsv);
 
-      // Create color masks sequentially instead of parallel
+      // Only use white and yellow masks for better performance
       final whiteMask = _createColorMask(hsv, 'white');
       final yellowMask = _createColorMask(hsv, 'yellow');
-      final blackMask = _createColorMask(hsv, 'black');
-      
-      resources.addAll([whiteMask, yellowMask, blackMask]);
+      resources.addAll([whiteMask, yellowMask]);
 
-      // Improve edge detection parameters
-      final cannyEdges = cv.canny(
-        cv.gaussianBlur(cv.cvtColor(resized, cv.COLOR_BGR2GRAY), (5, 5), 1.5),
-        20, // Lower threshold for better edge detection
-        100  // Upper threshold
-      );
-
-      // Combine all masks using bitwise operations
-      final combinedMask = cv.bitwiseOR(
-        cv.bitwiseOR(whiteMask, yellowMask),
-        blackMask
-      );
+      // Combine masks more efficiently
+      final combinedMask = cv.bitwiseOR(whiteMask, yellowMask);
       resources.add(combinedMask);
 
-      // Enhanced edge detection with color information
-      final combinedEdges = cv.Mat.zeros(processHeight, processWidth, cv.MatType.CV_8UC1);
-      resources.add(combinedEdges);
-      
-      // Combine traditional edge detection with color information
-      cv.bitwiseOR(cannyEdges, combinedMask, dst: combinedEdges);
+      // Simplified edge combination
+      cv.bitwiseOR(edges, combinedMask, dst: edges);
 
       // Apply ROI mask
       final mask = _createROIMask(processWidth, processHeight);
-      final maskedEdges = cv.Mat.zeros(processHeight, processWidth, cv.MatType.CV_8UC1);
-      resources.add(maskedEdges);
-      cv.bitwiseAND(combinedEdges, mask, dst: maskedEdges);
+      cv.bitwiseAND(edges, mask, dst: edges);
 
-      // Use probabilistic Hough transform with stricter parameters
+      // Optimize Hough transform parameters
       final lines = cv.HoughLinesP(
-        maskedEdges,
+        edges,
         1.0,         
         pi / 180.0,  
-        25,          // Increased threshold for more confident line detection
-        minLineLength: 30.0,  // Increased minimum length
-        maxLineGap: 20.0      // Reduced gap to avoid connecting unrelated segments
+        20,          // Reduced threshold
+        minLineLength: 20.0,  // Shorter minimum length
+        maxLineGap: 30.0      // Increased gap for better connection
       );
 
       // Enhanced line filtering with stricter criteria
@@ -187,15 +189,15 @@ class LaneDetector {
         final length = sqrt(dx * dx + dy * dy);
         
         // More restrictive conditions for valid lane lines
-        if (angle < 1.5 && // Stricter angle threshold
-            length > height * 0.15 && // Minimum length requirement
-            avgY > height * 0.6 && // Only consider lower portion of image
+        if (angle < 2.0 && // More permissive angle threshold
+            length > height * 0.12 && // Reduced minimum length requirement
+            avgY > height * 0.5 && // Look higher up in the image
             avgY < height * 0.95) { // Ignore lines too close to bottom
           
-          if (avgX < centerX && avgX > width * 0.1) { // Left lane boundary
-            _addToSegmentCluster(leftSegments, points, CLUSTER_DISTANCE);
-          } else if (avgX > centerX && avgX < width * 0.9) { // Right lane boundary
-            _addToSegmentCluster(rightSegments, points, CLUSTER_DISTANCE);
+          if (avgX < centerX && avgX > width * 0.02) { // More permissive left boundary
+            _addToSegmentCluster(leftSegments, points, CLUSTER_DISTANCE * 1.5); // Increased clustering distance
+          } else if (avgX > centerX && avgX < width * 0.98) { // More permissive right boundary
+            _addToSegmentCluster(rightSegments, points, CLUSTER_DISTANCE * 1.5);
           }
 
           // Visualize detected segments
@@ -247,20 +249,36 @@ class LaneDetector {
         }
       } else if (leftSegments.isNotEmpty) {
         double avgX = 0;
+        double avgY = 0;
         for (var point in leftSegments.first) {
           avgX += point.x;
+          avgY += point.y;
         }
         final leftX = avgX / leftSegments.first.length;
-        laneCenter = leftX + (width * 0.35);
-        isValidLane = leftSegments.first.length >= 3;
+        final leftY = avgY / leftSegments.first.length;
+        
+        // Estimate lane center based on line angle and position
+        final dy = height - leftY;
+        final dx = leftSegments.first.last.x - leftSegments.first.first.x;
+        final angle = atan2(dy, dx);
+        laneCenter = leftX + (width * 0.35 * cos(angle)); // Dynamic offset based on line angle
+        isValidLane = leftSegments.first.length >= 2; // Only need 2 points for validation
       } else if (rightSegments.isNotEmpty) {
         double avgX = 0;
+        double avgY = 0;
         for (var point in rightSegments.first) {
           avgX += point.x;
+          avgY += point.y;
         }
         final rightX = avgX / rightSegments.first.length;
-        laneCenter = rightX - (width * 0.35);
-        isValidLane = rightSegments.first.length >= 3;
+        final rightY = avgY / rightSegments.first.length;
+        
+        // Similar angle-based estimation for right lane
+        final dy = height - rightY;
+        final dx = rightSegments.first.last.x - rightSegments.first.first.x;
+        final angle = atan2(dy, dx);
+        laneCenter = rightX - (width * 0.35 * cos(angle));
+        isValidLane = rightSegments.first.length >= 2;
       } else {
         laneCenter = centerX;
       }
@@ -293,8 +311,10 @@ class LaneDetector {
         final points = segments.first.length;
         final avgLength = _calculateAverageSegmentLength(segments.first);
         
-        return min(1.0, (points / MIN_CONFIDENCE_POINTS) * 
-                       (avgLength / (height * MIN_LINE_LENGTH_RATIO)));
+        // More lenient confidence calculation
+        final minPoints = 2; // Reduced minimum points
+        final lengthFactor = avgLength / (height * MIN_LINE_LENGTH_RATIO);
+        return min(1.0, (points / minPoints) * lengthFactor * 1.5); // Increased multiplier
       }
 
       // Calculate confidence for both sides
@@ -438,47 +458,39 @@ class LaneDetector {
            length < height * 0.8;   // Maximum length
   }
 
-  // Modified color mask creation method
+  // Optimize color mask creation
   static cv.Mat _createColorMask(cv.Mat hsv, String type) {
     final mask = cv.Mat.zeros(hsv.rows, hsv.cols, cv.MatType.CV_8UC1);
     
     try {
       switch (type) {
         case 'white':
-          // Improved white detection by considering both value and saturation
-          final lowerWhite = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 215));
-          final upperWhite = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 30, 255));
-          cv.inRange(hsv, lowerWhite, upperWhite, dst: mask);
-          lowerWhite.dispose();
-          upperWhite.dispose();
+          // Simplified white detection
+          cv.inRange(
+            hsv, 
+            cv.Mat.fromList(1, 3, cv.MatType.CV_8UC1, [0, 0, 215]), 
+            cv.Mat.fromList(1, 3, cv.MatType.CV_8UC1, [180, 30, 255]), 
+            dst: mask
+          );
           break;
 
         case 'yellow':
-          // Wider range for yellow detection with higher minimum saturation
-          final lowerYellow = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(15, 120, 120));
-          final upperYellow = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(40, 255, 255));
-          cv.inRange(hsv, lowerYellow, upperYellow, dst: mask);
-          lowerYellow.dispose();
-          upperYellow.dispose();
-          break;
-
-        case 'black':
-          // Improved black detection focusing on low value pixels
-          final lowerBlack = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(0, 0, 0));
-          final upperBlack = cv.Mat.zeros(1, 1, cv.MatType.CV_8UC3)..setTo(cv.Scalar(180, 255, 50));
-          cv.inRange(hsv, lowerBlack, upperBlack, dst: mask);
-          lowerBlack.dispose();
-          upperBlack.dispose();
+          // Simplified yellow detection
+          cv.inRange(
+            hsv, 
+            cv.Mat.fromList(1, 3, cv.MatType.CV_8UC1, [15, 120, 120]), 
+            cv.Mat.fromList(1, 3, cv.MatType.CV_8UC1, [40, 255, 255]), 
+            dst: mask
+          );
           break;
 
         default:
           throw Exception('Invalid color mask type');
       }
 
-      // Apply morphological operations to reduce noise
+      // Simplified noise reduction
       final kernel = cv.getStructuringElement(cv.MORPH_RECT, (3, 3));
       cv.morphologyEx(mask, cv.MORPH_OPEN, kernel, dst: mask);
-      cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel, dst: mask);
       kernel.dispose();
 
       return mask;
@@ -500,5 +512,29 @@ class LaneDetector {
     }
     
     return totalLength / (points.length - 1);
+  }
+
+  static cv.Point? _findIntersection(cv.Point p1, cv.Point p2, cv.Point p3, cv.Point p4) {
+    // Line 1 represented as a1x + b1y = c1
+    final a1 = p2.y - p1.y;
+    final b1 = p1.x - p2.x;
+    final c1 = a1 * p1.x + b1 * p1.y;
+
+    // Line 2 represented as a2x + b2y = c2
+    final a2 = p4.y - p3.y;
+    final b2 = p3.x - p4.x;
+    final c2 = a2 * p3.x + b2 * p3.y;
+
+    final determinant = a1 * b2 - a2 * b1;
+
+    if (determinant == 0) {
+      // Lines are parallel
+      return null;
+    }
+
+    final x = (b2 * c1 - b1 * c2) / determinant;
+    final y = (a1 * c2 - a2 * c1) / determinant;
+
+    return cv.Point(x.toInt(), y.toInt());
   }
 }

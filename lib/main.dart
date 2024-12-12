@@ -8,7 +8,7 @@ import 'guidance_service.dart';
 import 'lane_guide_painter.dart';
 
 class Constants {
-  static const processingInterval = Duration(milliseconds: 100); // Faster processing
+  static const processingInterval = Duration(milliseconds: 50); // Faster processing
   static const deviationThreshold = 0.1;
   static const guidanceTextSize = 24.0;
   static const maxFPS = 30; // Limit FPS for better performance
